@@ -9,13 +9,64 @@ const MAX_AUDIO_BYTES = 48 * 1024 * 1024; // 48 MB safety margin (limit 50 MB)
 // ─── YouTube Innertube API ───
 
 const INNERTUBE_URL = 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false';
-const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
-// Client configs yang dicoba berurutan jika WEB diblokir
-const CLIENT_CONFIGS = [
-  { clientName: 'WEB', clientVersion: '2.20261101.00.00' },
-  { clientName: 'ANDROID', clientVersion: '19.29.37', androidSdkVersion: 30 },
-  { clientName: 'IOS', clientVersion: '19.29.1' },
+// Konfigurasi client modern yang kompatibel dengan protokol Innertube
+export const CLIENT_CONFIGS = [
+  {
+    name: 'ANDROID',
+    userAgent: 'com.google.android.youtube/21.26.364 (Linux; U; Android 11) gzip',
+    buildPayload: (videoId) => ({
+      videoId,
+      context: {
+        client: {
+          clientName: 'ANDROID',
+          clientVersion: '21.26.364',
+          androidSdkVersion: 30,
+          osName: 'Android',
+          osVersion: '11',
+          hl: 'en',
+          gl: 'US',
+        },
+      },
+    }),
+  },
+  {
+    name: 'IOS',
+    userAgent: 'com.google.ios.youtube/21.26.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)',
+    buildPayload: (videoId) => ({
+      videoId,
+      context: {
+        client: {
+          clientName: 'IOS',
+          clientVersion: '21.26.4',
+          deviceMake: 'Apple',
+          deviceModel: 'iPhone16,2',
+          osName: 'iPhone',
+          osVersion: '18.3.2.22D82',
+          hl: 'en',
+          gl: 'US',
+        },
+      },
+    }),
+  },
+  {
+    name: 'WEB_EMBEDDED',
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    buildPayload: (videoId) => ({
+      videoId,
+      context: {
+        client: {
+          clientName: 'WEB_EMBEDDED_PLAYER',
+          clientVersion: '2.20260708.00.00',
+          hl: 'en',
+          gl: 'US',
+        },
+        thirdParty: {
+          embedUrl: 'https://www.google.com/',
+        },
+      },
+    }),
+  },
 ];
 
 /**
@@ -40,13 +91,10 @@ export function extractVideoId(text) {
  * Coba beberapa client config jika yang pertama diblokir.
  */
 async function fetchPlayerData(videoId) {
+  let lastReason = 'Tidak diketahui';
+
   for (const client of CLIENT_CONFIGS) {
-    const payload = {
-      videoId,
-      context: {
-        client: { ...client, hl: 'en', gl: 'US' },
-      },
-    };
+    const payload = client.buildPayload(videoId);
 
     let res;
     try {
@@ -54,65 +102,104 @@ async function fetchPlayerData(videoId) {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'User-Agent': USER_AGENT,
+          'User-Agent': client.userAgent,
         },
         body: JSON.stringify(payload),
       });
-    } catch {
+    } catch (err) {
+      lastReason = `Koneksi gagal: ${err.message}`;
       continue;
     }
 
-    if (!res.ok) continue;
+    if (!res.ok) {
+      lastReason = `HTTP ${res.status} ${res.statusText}`;
+      continue;
+    }
 
     const data = await res.json();
     const status = data.playabilityStatus?.status;
 
     if (status === 'OK' && data.streamingData) {
-      return { ok: true, data, clientUsed: client.clientName };
+      return { ok: true, data, clientUsed: client.name };
     }
 
-    // LOGIN_REQUIRED → coba client berikutnya
-    if (status === 'LOGIN_REQUIRED' || status === 'ERROR') continue;
+    // Catat alasan kegagalan
+    lastReason = data.playabilityStatus?.reason || `Status: ${status}`;
 
-    // Status lain (UNPLAYABLE, dsb) → langsung return error
+    // Coba client berikutnya jika status bukan OK
+    if (status === 'LOGIN_REQUIRED' || status === 'UNPLAYABLE' || status === 'ERROR') {
+      continue;
+    }
+
     return {
       ok: false,
-      reason: data.playabilityStatus?.reason || `Status: ${status}`,
+      reason: lastReason,
     };
   }
 
   return {
     ok: false,
-    reason: 'Semua client config ditolak YouTube. IP server kemungkinan diblokir.',
+    reason: `Semua client config gagal. Terakhir: ${lastReason}`,
   };
 }
 
 /**
- * Pilih stream audio terbaik dari adaptiveFormats.
- * Prioritas: yang punya URL langsung, bitrate tertinggi.
+ * Pilih stream audio terbaik dari streamingData.
+ * Prioritas:
+ * 1. Audio murni di adaptiveFormats dengan .url langsung
+ * 2. Progressive format (itag 18 dll) dengan .url langsung (mengandung track AAC)
+ * 3. URL terkunci cipher
  */
-function pickBestAudio(adaptiveFormats) {
-  const audioStreams = (adaptiveFormats || [])
-    .filter(f => f.mimeType?.startsWith('audio/'));
+function pickBestAudio(streamingData) {
+  const adaptive = streamingData?.adaptiveFormats || [];
+  const formats = streamingData?.formats || [];
 
-  if (audioStreams.length === 0) return null;
+  // 1. Cek audio murni di adaptiveFormats
+  const audioStreams = adaptive.filter((f) => f.mimeType?.startsWith('audio/'));
+  const directAudio = audioStreams.filter((f) => f.url && !f.signatureCipher && !f.cipher);
+  if (directAudio.length > 0) {
+    directAudio.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+    const picked = directAudio[0];
+    return {
+      url: picked.url,
+      cipher: null,
+      itag: picked.itag,
+      mimeType: picked.mimeType,
+      bitrate: picked.bitrate,
+      contentLength: picked.contentLength ? Number(picked.contentLength) : null,
+    };
+  }
 
-  // Prioritaskan yang punya .url langsung (bukan signatureCipher)
-  const directStreams = audioStreams.filter(f => f.url && !f.signatureCipher && !f.cipher);
-  const pool = directStreams.length > 0 ? directStreams : audioStreams;
+  // 2. Cek format progresif (itag 18 dll) yang punya AAC audio + direct URL
+  const directProg = formats.filter((f) => f.url && !f.signatureCipher && !f.cipher);
+  if (directProg.length > 0) {
+    // Ambil yang paling ringkas (itag 18) agar hemat kuota dan memori Telegram
+    directProg.sort((a, b) => (a.bitrate || 0) - (b.bitrate || 0));
+    const picked = directProg[0];
+    return {
+      url: picked.url,
+      cipher: null,
+      itag: picked.itag,
+      mimeType: 'audio/mp4', // Container MP4/AAC untuk Telegram sendAudio
+      bitrate: picked.audioBitrate || 128000,
+      contentLength: picked.contentLength ? Number(picked.contentLength) : null,
+    };
+  }
 
-  // Sort by bitrate descending
-  pool.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+  // 3. Jika ada audio tapi terkunci cipher
+  const cipherAudio = audioStreams.find((f) => f.signatureCipher || f.cipher);
+  if (cipherAudio) {
+    return {
+      url: null,
+      cipher: cipherAudio.signatureCipher || cipherAudio.cipher,
+      itag: cipherAudio.itag,
+      mimeType: cipherAudio.mimeType,
+      bitrate: cipherAudio.bitrate,
+      contentLength: cipherAudio.contentLength ? Number(cipherAudio.contentLength) : null,
+    };
+  }
 
-  const picked = pool[0];
-  return {
-    url: picked.url || null,
-    cipher: picked.signatureCipher || picked.cipher || null,
-    itag: picked.itag,
-    mimeType: picked.mimeType,
-    bitrate: picked.bitrate,
-    contentLength: picked.contentLength ? Number(picked.contentLength) : null,
-  };
+  return null;
 }
 
 /**
@@ -120,15 +207,35 @@ function pickBestAudio(adaptiveFormats) {
  */
 async function downloadAudioBytes(audioUrl) {
   const res = await fetch(audioUrl, {
-    headers: { 'User-Agent': USER_AGENT },
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)',
+    },
   });
 
   if (!res.ok) {
     throw new Error(`Download gagal: HTTP ${res.status} ${res.statusText}`);
   }
 
-  const buffer = await res.arrayBuffer();
-  return new Uint8Array(buffer);
+  // Jika runtime TGCloud menyediakan helper bytes()
+  if (typeof res.bytes === 'function') {
+    return await res.bytes();
+  }
+
+  // Kumpulkan chunk dari async iterator res.body
+  const chunks = [];
+  let totalLength = 0;
+  for await (const chunk of res.body) {
+    chunks.push(chunk);
+    totalLength += chunk.length;
+  }
+
+  const combined = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return combined;
 }
 
 /**
@@ -180,7 +287,7 @@ async function logDownload(tgId, videoId, title, itag, size, status, errorMsg) {
  * Fungsi utama: proses permintaan download audio.
  */
 export async function handleDownload(tgId, videoId) {
-  // 1. Kirim pesan "sedang memproses"
+  // 1. Kirim pesan status awal
   const statusMsg = await api.sendMessage({
     chat_id: tgId,
     text: '⏳ Mengambil informasi video...',
@@ -203,8 +310,7 @@ export async function handleDownload(tgId, videoId) {
     const durationSec = Number(data.videoDetails?.lengthSeconds || 0);
 
     // 3. Pilih stream audio terbaik
-    const formats = data.streamingData?.adaptiveFormats || [];
-    const audio = pickBestAudio(formats);
+    const audio = pickBestAudio(data.streamingData);
 
     if (!audio) {
       await logDownload(tgId, videoId, title, null, null, 'error', 'Tidak ada stream audio ditemukan');
@@ -231,9 +337,9 @@ export async function handleDownload(tgId, videoId) {
       return;
     }
 
-    // 5. Download audio
+    // 5. Download audio bytes
     await editStatus(tgId, statusMsgId,
-      `⬇️ Mengunduh audio...\n📺 ${title}\n🎵 ${audio.mimeType} • ${Math.round((audio.bitrate || 0) / 1000)} kbps`
+      `⬇️ Mengunduh audio via [${clientUsed}]...\n📺 ${title}\n🎵 ${audio.mimeType}`
     );
 
     const audioBytes = await downloadAudioBytes(audio.url);
@@ -280,20 +386,20 @@ export async function handleDownload(tgId, videoId) {
 // ─── Tes IP (command /testip) ───
 
 export async function handleTestIP(tgId) {
-  const testVideoId = 'jNQXAC9IVRw'; // "Me at the zoo" — video non-musik pertama di YouTube
+  const testVideoId = 'jNQXAC9IVRw'; // "Me at the zoo"
 
-  await api.sendMessage({ chat_id: tgId, text: '🔍 Menguji koneksi ke YouTube dari IP server...' });
+  await api.sendMessage({ chat_id: tgId, text: '🔍 Menguji koneksi YouTube dari IP server...' });
 
   for (const client of CLIENT_CONFIGS) {
-    const payload = {
-      videoId: testVideoId,
-      context: { client: { ...client, hl: 'en', gl: 'US' } },
-    };
+    const payload = client.buildPayload(testVideoId);
 
     try {
       const res = await fetch(INNERTUBE_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'User-Agent': USER_AGENT },
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': client.userAgent,
+        },
         body: JSON.stringify(payload),
       });
 
@@ -301,33 +407,37 @@ export async function handleTestIP(tgId) {
       const status = data.playabilityStatus?.status;
       const reason = data.playabilityStatus?.reason || '-';
       const hasStreaming = Boolean(data.streamingData);
-      const audioCount = (data.streamingData?.adaptiveFormats || [])
-        .filter(f => f.mimeType?.startsWith('audio/')).length;
-      const directAudio = (data.streamingData?.adaptiveFormats || [])
-        .filter(f => f.mimeType?.startsWith('audio/') && f.url).length;
+
+      const adaptive = data.streamingData?.adaptiveFormats || [];
+      const formats = data.streamingData?.formats || [];
+
+      const audioStreams = adaptive.filter((f) => f.mimeType?.startsWith('audio/'));
+      const directAudio = audioStreams.filter((f) => f.url).length;
+      const directProg = formats.filter((f) => f.url).length;
 
       const lines = [
-        `📡 Client: ${client.clientName}`,
+        `📡 Client: ${client.name}`,
         `• HTTP: ${res.status}`,
         `• Status: ${status}`,
         `• Reason: ${reason}`,
         `• streamingData: ${hasStreaming ? '✅ Ada' : '❌ Tidak ada'}`,
-        `• Audio streams: ${audioCount} (${directAudio} dengan URL langsung)`,
+        `• Audio Murni (URL langsung): ${directAudio}/${audioStreams.length}`,
+        `• Format Progresif (URL langsung): ${directProg}/${formats.length}`,
       ];
 
-      if (status === 'OK' && directAudio > 0) {
-        lines.push('', '✅ Client ini bisa digunakan!');
-      } else if (status === 'OK' && audioCount > 0) {
-        lines.push('', '⚠️ Audio ada tapi terkunci cipher');
-      } else if (status !== 'OK') {
-        lines.push('', '🚫 Client ini diblokir');
+      if (status === 'OK' && (directAudio > 0 || directProg > 0)) {
+        lines.push('', '✅ Client ini SIAP DIGUNAKAN!');
+      } else if (status === 'OK') {
+        lines.push('', '⚠️ Status OK, format URL ditahan/cipher');
+      } else {
+        lines.push('', '🚫 Client ini dibatasi YouTube');
       }
 
       await api.sendMessage({ chat_id: tgId, text: lines.join('\n') });
     } catch (err) {
       await api.sendMessage({
         chat_id: tgId,
-        text: `📡 Client: ${client.clientName}\n❌ Error: ${err.message}`,
+        text: `📡 Client: ${client.name}\n❌ Error: ${err.message}`,
       });
     }
   }
