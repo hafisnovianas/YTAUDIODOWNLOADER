@@ -2,8 +2,9 @@ import { api, fetch, InputFile } from 'sdk';
 import { db } from 'sdk';
 import { eq } from 'sdk/db';
 import { downloads } from '../schema.js';
+import { ADMIN_TG_ID } from './config.js';
 
-export const ADMIN_TG_ID = 8738554818;
+export { ADMIN_TG_ID };
 const MAX_AUDIO_BYTES = 48 * 1024 * 1024; // 48 MB safety margin (limit 50 MB)
 
 // ─── YouTube Innertube API ───
