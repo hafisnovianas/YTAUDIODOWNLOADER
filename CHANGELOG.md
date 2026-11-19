@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Perbaikan runtime error `res.arrayBuffer is not a function` pada `downloadAudioBytes` dengan mengiterasi chunk biner dari stream `res.body` via async iterator sesuai arsitektur V8 isolate TGCloud SDK.
 
 ### Added
+- Fitur inspeksi log admin interaktif: `/errors [n]` untuk audit error runtime dan `/history [n]` untuk riwayat unduhan dengan pemecahan pesan otomatis (*auto-chunking* batas 4.096 karakter Telegram).
+- Dukungan argumen dinamis pada router perintah `tgcloud/handlers/message.js` (`parseCommandAndArgs`).
+- Fungsi utilitas format waktu WIB (`formatWibDate`) dan format ukuran berkas (`formatBytes`) di `tgcloud/lib/ytaudio.js`.
 - Template konfigurasi `.env.example` untuk publik.
 - Inisialisasi awal proyek Telegram Serverless Bot (`@tgcloud/cli`) untuk YT Audio Downloader.
 - Router pesan `tgcloud/handlers/message.js` untuk penanganan perintah `/start`, `/help`, `/testip`, `/stats`, dan pengenalan URL YouTube otomatis.

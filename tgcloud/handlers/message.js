@@ -5,15 +5,20 @@ import {
   handleDownload,
   handleTestIP,
   handleStats,
+  handleErrors,
+  handleHistory,
   ADMIN_TG_ID,
 } from '../lib/ytaudio.js';
 import { errorLogs } from '../schema.js';
 
-function parseCommand(text) {
-  if (typeof text !== 'string') return null;
+function parseCommandAndArgs(text) {
+  if (typeof text !== 'string') return { cmd: null, arg: '' };
   const trimmed = text.trim();
-  if (!trimmed.startsWith('/')) return null;
-  return trimmed.split(/\s+/)[0].toLowerCase().split('@')[0];
+  if (!trimmed.startsWith('/')) return { cmd: null, arg: '' };
+  const parts = trimmed.split(/\s+/);
+  const cmd = parts[0].toLowerCase().split('@')[0];
+  const arg = parts.slice(1).join(' ').trim();
+  return { cmd, arg };
 }
 
 async function sendSafe(params) {
@@ -60,7 +65,7 @@ export default async function (message) {
 
   const tgId = message.from?.id ?? message.chat.id;
   const text = message.text;
-  const cmd = parseCommand(text);
+  const { cmd, arg } = parseCommandAndArgs(text);
 
   try {
     // ── Commands ──
@@ -71,9 +76,12 @@ export default async function (message) {
           '🎵 YT Audio Downloader\n\n' +
           'Kirimkan link YouTube, dan saya akan mengekstrak audionya untuk Anda.\n\n' +
           'Perintah:\n' +
-          '/testip — Cek apakah IP server bisa akses YouTube\n' +
-          '/stats — Statistik download (admin)\n' +
-          '/help — Bantuan',
+          '/help — Bantuan & panduan penggunaan\n' +
+          '/testip — Cek koneksi IP server ke YouTube\n\n' +
+          'Perintah Khusus Admin:\n' +
+          '/stats — Ringkasan jumlah unduhan\n' +
+          '/errors [n] — Rincian error runtime terakhir (contoh: /errors 20)\n' +
+          '/history [n] — Riwayat unduhan terakhir (contoh: /history 25)',
       });
       return;
     }
@@ -92,8 +100,12 @@ export default async function (message) {
           '• youtube.com/shorts/...\n\n' +
           'Batasan:\n' +
           '• Maks ukuran audio: 50 MB\n' +
-          '• Video musik resmi (VEVO) mungkin terkunci cipher\n' +
-          '• Konten DRM tidak bisa diunduh',
+          '• Video musik resmi (VEVO) didukung via track AAC\n' +
+          '• Konten DRM berbayar tidak bisa diunduh\n\n' +
+          'Perintah Admin:\n' +
+          '• /stats — Statistik agregat\n' +
+          '• /errors [n] — Cek rincian error terakhir\n' +
+          '• /history [n] — Cek riwayat unduhan terakhir',
       });
       return;
     }
@@ -105,6 +117,16 @@ export default async function (message) {
 
     if (cmd === '/stats') {
       await handleStats(tgId);
+      return;
+    }
+
+    if (cmd === '/errors') {
+      await handleErrors(tgId, arg);
+      return;
+    }
+
+    if (cmd === '/history') {
+      await handleHistory(tgId, arg);
       return;
     }
 

@@ -1,7 +1,7 @@
 import { api, fetch, InputFile } from 'sdk';
 import { db } from 'sdk';
-import { eq } from 'sdk/db';
-import { downloads } from '../schema.js';
+import { eq, desc } from 'sdk/db';
+import { downloads, errorLogs } from '../schema.js';
 import { ADMIN_TG_ID } from './config.js';
 
 export { ADMIN_TG_ID };
@@ -471,4 +471,135 @@ export async function handleStats(tgId) {
   ];
 
   await api.sendMessage({ chat_id: tgId, text: lines.join('\n') });
+}
+
+// ─── Formatting & Chunked Messaging Helpers ───
+
+function formatWibDate(date) {
+  const d = date instanceof Date ? date : new Date();
+  return `${new Date(d.getTime() + 7 * 3600 * 1000).toISOString().slice(0, 19).replace('T', ' ')} WIB`;
+}
+
+function formatBytes(bytes) {
+  const b = Number(bytes) || 0;
+  if (b === 0) return '0 B';
+  if (b < 1024) return `${b} B`;
+  if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
+  return `${(b / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * Mengirim pesan dengan pemecahan otomatis (auto-chunking)
+ * agar tidak pernah melanggar batas 4.096 karakter Telegram.
+ */
+async function sendChunked(chatId, text) {
+  const MAX_LEN = 3600;
+  if (text.length <= MAX_LEN) {
+    await api.sendMessage({ chat_id: chatId, text });
+    return;
+  }
+
+  const lines = text.split('\n');
+  let currentChunk = '';
+
+  for (const line of lines) {
+    if ((currentChunk + '\n' + line).length > MAX_LEN) {
+      if (currentChunk.trim()) {
+        await api.sendMessage({ chat_id: chatId, text: currentChunk });
+      }
+      currentChunk = line;
+    } else {
+      currentChunk = currentChunk ? currentChunk + '\n' + line : line;
+    }
+  }
+
+  if (currentChunk.trim()) {
+    await api.sendMessage({ chat_id: chatId, text: currentChunk });
+  }
+}
+
+/**
+ * Admin: melihat rincian error runtime terakhir (/errors [jumlah])
+ */
+export async function handleErrors(tgId, paramStr) {
+  if (tgId !== ADMIN_TG_ID) {
+    await api.sendMessage({ chat_id: tgId, text: '⛔ Perintah ini khusus admin.' });
+    return;
+  }
+
+  const parsed = parseInt(paramStr, 10);
+  const limit = Number.isInteger(parsed) && parsed > 0 ? Math.min(parsed, 100) : 10;
+
+  const rows = await db
+    .select()
+    .from(errorLogs)
+    .orderBy(desc(errorLogs.createdAt), desc(errorLogs.id))
+    .limit(limit)
+    .all();
+
+  if (rows.length === 0) {
+    await api.sendMessage({ chat_id: tgId, text: '✅ Belum ada error runtime yang tercatat.' });
+    return;
+  }
+
+  const lines = [`🚨 Menampilkan ${rows.length} Error Runtime Terakhir:`, ''];
+  for (const row of rows) {
+    lines.push(
+      `#${row.id} [${row.handler}] user:${row.tgId ?? '-'} ctx:${row.context ?? '-'} (${formatWibDate(row.createdAt)})`
+    );
+    lines.push(`↳ ${row.message}`);
+    if (row.stack) {
+      const topStack = row.stack.split('\n').slice(0, 2).join(' ').trim();
+      if (topStack) lines.push(`  stack: ${topStack}`);
+    }
+    lines.push('');
+  }
+
+  lines.push('💡 Tip: Gunakan /errors <jumlah> untuk melihat lebih banyak (contoh: /errors 20)');
+
+  await sendChunked(tgId, lines.join('\n'));
+}
+
+/**
+ * Admin: melihat rincian riwayat unduhan terakhir (/history [jumlah])
+ */
+export async function handleHistory(tgId, paramStr) {
+  if (tgId !== ADMIN_TG_ID) {
+    await api.sendMessage({ chat_id: tgId, text: '⛔ Perintah ini khusus admin.' });
+    return;
+  }
+
+  const parsed = parseInt(paramStr, 10);
+  const limit = Number.isInteger(parsed) && parsed > 0 ? Math.min(parsed, 100) : 10;
+
+  const rows = await db
+    .select()
+    .from(downloads)
+    .orderBy(desc(downloads.createdAt), desc(downloads.id))
+    .limit(limit)
+    .all();
+
+  if (rows.length === 0) {
+    await api.sendMessage({ chat_id: tgId, text: 'Belum ada riwayat unduhan yang tercatat.' });
+    return;
+  }
+
+  const lines = [`📜 Menampilkan ${rows.length} Riwayat Download Terakhir:`, ''];
+  rows.forEach((row, idx) => {
+    const icon = row.status === 'ok' ? '✅' : '❌';
+    const sizeStr = row.audioSize ? ` • ${formatBytes(row.audioSize)}` : '';
+    const titleStr = row.title ? `"${row.title}"` : `ID: ${row.videoId}`;
+    lines.push(`${idx + 1}. ${icon} ${titleStr}${sizeStr}`);
+    lines.push(
+      `   Status: ${row.status} | User: ${row.tgId} | ${formatWibDate(row.createdAt)}`
+    );
+    if (row.errorMsg) {
+      lines.push(`   Alasan: ${row.errorMsg}`);
+    }
+    lines.push('');
+  });
+
+  lines.push('💡 Tip: Gunakan /history <jumlah> untuk melihat lebih banyak (contoh: /history 25)');
+
+  await sendChunked(tgId, lines.join('\n'));
 }
